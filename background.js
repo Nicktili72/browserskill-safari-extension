@@ -90,8 +90,12 @@ function makeBackground(env) {
       if (frame.error) { console.error('[bsk] handshake rejected', frame.error); ws.close(); return; }
       heartbeatTimer = setInterval(() => send({ event: 'system.heartbeat', payload: {} }), HEARTBEAT_MS);
     }
-    // Frames we don't act on (events like session.user_interrupt): the
-    // reduced scope here has no interrupt-gate UI to wire them into.
+    // Inbound frames we don't act on: the reduced tool set never carries
+    // inbound events here (session.user_interrupt is daemon-internal — the
+    // daemon handles it inside handle_inbound_text, so nothing like it ever
+    // reaches this loop). Anything unexpected is ignored; worst case, a
+    // malformed frame idles the socket until the daemon's 20s heartbeat
+    // timeout tears it down.
   }
 
   function send(frameLike) {

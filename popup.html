@@ -20,9 +20,10 @@
         el.textContent = 'Daemon: NOT connected';
         return;
       }
+      const esc = (v) => String(v).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
       el.innerHTML =
         'Daemon: <b>' + (s.connected ? 'connected' : 'NOT connected') + '</b><br>' +
-        'Session: ' + (s.activeSession || 'none') + '<br>' +
+        'Session: ' + esc(s.activeSession || 'none') + '<br>' +
         'Agent tabs: ' + s.tabCount;
     });
   </script>
