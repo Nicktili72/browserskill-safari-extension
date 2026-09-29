@@ -33,7 +33,7 @@ const protocolModule = () => (typeof require !== 'undefined' ? require('./protoc
 
 function makeBackground(env) {
   const { browser, WebSocket, console, crypto, setTimeout, clearTimeout, setInterval, clearInterval } = env;
-  const { handshakeParams, NO_DIALOGS, keyToCode, rpcOk, rpcErr } = protocolModule();
+  const { handshakeParams, NO_DIALOGS, keyToCode, keyToModifiers, rpcOk, rpcErr } = protocolModule();
   const sessions = new Map(); // session_id -> { agentWindowId, agentTabIds:Set<number>, borrowed:Map<tabId,{originalWindowId,originalIndex}> }
   const pendingConfirmations = new Map(); // requestId -> resolve(allow)
   let ws = null;
@@ -249,12 +249,25 @@ function makeBackground(env) {
       const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
       await browser.tabs.update(tabId, { url: p.url });
       let reached = 'timeout';
-      for (let i = 0; i < 30; i++) {
-        const t = await browser.tabs.get(tabId);
-        if (t.status === 'complete') { reached = 'complete'; break; }
+      let t;
+      // A tab closed/lost mid-poll must not reject the whole call: the
+      // daemon needs an answer, and an RPC *error* says far less than
+      // reached:'tab_closed'. Same-document (pushState) navigations never
+      // leave 'complete', so the loop breaks immediately and reports the
+      // live tab state (this also no longer burns the full 15 s on them).
+      const live = (tabId) => browser.tabs.get(tabId).catch(() => null);
+      let poll = await live(tabId);
+      for (let i = 0; i < 30 && poll && poll.status !== 'complete'; i++) {
         await sleep(500);
+        poll = await live(tabId);
       }
-      const t = await browser.tabs.get(tabId);
+      if (!poll) {
+        reached = 'tab_closed';
+        t = { url: p.url }; // don't claim a final_url we cannot read
+      } else {
+        t = poll;
+        reached = poll.status === 'complete' ? 'complete' : 'timeout';
+      }
       return withDialogs({ tab_id: tabId, url: p.url, final_url: t.url, reached });
     },
 
@@ -278,8 +291,15 @@ function makeBackground(env) {
 
     'tool.press': async (p) => {
       const tabId = p.tab_id ?? (await defaultTabId(p.session_id));
-      const r = await page(tabId, { op: 'press', ref: p.ref, selector: p.selector, key: p.key, code: keyToCode(p.key) });
-      return withDialogs({ tab_id: tabId, key: p.key, code: keyToCode(p.key), modifiers: p.modifiers || [], used_ref: r.usedRef, used_selector: r.usedSelector });
+      // Combine explicit `params.modifiers` with any modifier *name* in the
+      // key string: 'Control+a' -> ['Control'] + KeyA, and even a bare
+      // 'Control' (keyToCode's fallback keeps the name) yields ['Control'].
+      const mods = [...new Set([
+        ...(p.modifiers || []),
+        ...MODIFIER_NAMES.filter((m) => m === p.key || p.key.includes(`+${m}+`) || p.key.endsWith(`+${m}`) || p.key.endsWith(`+${m}+`)),
+      ])];
+      const r = await page(tabId, { op: 'press', ref: p.ref, selector: p.selector, key: p.key, code: keyToCode(p.key), modifiers: mods });
+      return withDialogs({ tab_id: tabId, key: p.key, code: keyToCode(p.key), modifiers: mods, used_ref: r.usedRef, used_selector: r.usedSelector });
     },
 
     'tool.scroll_to': async (p) => {
@@ -306,14 +326,35 @@ function makeBackground(env) {
     return handler(params);
   }
 
+  function wsConnected() {
+    // Readiness probe only — the popup's status line uses this.
+    return !!(ws && ws.readyState === 1);
+  }
+
+  function activeSessionId() {
+    // Newest session first: sessions are only added/removed by
+    // session_start/session_stop, so insertion order = start order.
+    for (const id of [...sessions.keys()].reverse()) if (sessions.get(id)) return id;
+    return null;
+  }
+
+  function status() {
+    return { connected: wsConnected(), activeSession: activeSessionId(), tabCount: [...sessions.values()].reduce((n, s) => n + s.agentTabIds.size, 0) };
+  }
+
   browser.runtime.onMessage.addListener((msg) => {
     if (msg?.type === 'borrow-confirm-result') {
       const finish = pendingConfirmations.get(msg.requestId);
       if (finish) finish(!!msg.allow);
     }
+    // The toolbar popup (browser_action.default_popup) is a *page action*
+    // popup: its own chrome-untrusted origin, with no DOM access to this
+    // page, so the read-only status line is answered over runtime
+    // messaging. Kept read-only on purpose — see popup.html.
+    if (msg?.type === 'bsk-status-request') return Promise.resolve(status());
   });
 
-  return { connect, dispatch, sessions };
+  return { connect, dispatch, sessions, status };
 }
 
 if (typeof module !== 'undefined') {
