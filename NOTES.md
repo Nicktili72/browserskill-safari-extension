@@ -47,25 +47,20 @@ ditto -c -k --keepParent "BrowserSkill for Safari.app" "BrowserSkill for Safari.
 xcrun notarytool submit "BrowserSkill for Safari.zip" --keychain-profile "<profile-name>" --wait
 ```
 
-**Then check readiness** with `./check-notarization.sh` (repo root) — see below for what it's actually waiting on.
+**Then staple:** `./check-notarization.sh` (repo root) runs `stapler staple` on the export and tells you if it worked.
 
-### The propagation gap (confirmed, not a local problem)
+### If `stapler` says "Record not found"
 
-`notarytool submit --wait` reporting `Accepted` does **not** mean `stapler staple` will work yet. Apple runs the notarization *approval* pipeline and the ticket-*serving* database (what `stapler`/Gatekeeper actually query) as separate backend systems, and there's a real, sometimes multi-hour sync gap between them.
+Almost always: **the app you're stapling isn't the build you submitted.** Notarization tickets are keyed by cdhash, and any re-export or re-sign (even of identical source) produces a new cdhash. An earlier version of these notes blamed a multi-hour Apple-side "propagation gap" — that was wrong. The real case: a build was submitted 2026-09-27, the app was re-exported 2026-10-01, and the new binary's cdhash was never submitted. Resubmitting the current export stapled immediately.
 
-How this was confirmed, in order, all ruling out a local cause:
-1. `codesign --verify --deep --strict` on the exported app: passes cleanly.
-2. cdhashes on disk match the ticket's cdhashes exactly (`notarytool log <id>`).
-3. `sudo pkill -HUP ocspd` (forces a fresh check instead of a cached verdict): no change.
-4. Live packet-level evidence — captured with:
-   ```bash
-   /usr/bin/log stream --style compact --predicate 'process == "stapler"' &
-   xcrun stapler staple "BrowserSkill for Safari.app"
-   ```
-   showed the actual HTTPS request to Apple completing with a clean **200 response in ~267ms** (TLS fine, trust evaluation fine, "finished successfully" at the network layer) — but only **~2.6KB** back, consistent with a "ticket not found" answer rather than an actual ticket. Not a network, DNS, or cache problem; Apple's ticket DB genuinely hadn't indexed this submission yet.
-5. Safari's own extension loading was confirmed to hit the exact same local verdict as `spctl` — it is **not** a separate, more lenient check. Until `check-notarization.sh` reports ready, Safari will not load a Developer ID build without Allow Unsigned Extensions, no matter how "Accepted" `notarytool` reports it.
+Diagnose in 30 seconds:
+```bash
+codesign -dvvv "BrowserSkill for Safari.app" 2>&1 | grep ^CDHash
+xcrun notarytool log <submission-id> --keychain-profile "<profile-name>" | grep -A1 'BrowserSkill for Safari.app"'   # cdhash of the notarized binary
+```
+If they differ, re-zip the *current* export and resubmit (the **Notarize** step above), then staple. Always zip, submit, and staple the same export — don't re-export in between.
 
-No further local diagnostic added value beyond this — it's purely waiting on Apple's side. Re-run `check-notarization.sh` occasionally; no other action needed.
+Safari's extension loader uses the same Gatekeeper verdict as `spctl -a -vvv -t exec <app>`; until that says "Notarized Developer ID", Safari won't load the build without Develop → Allow Unsigned Extensions.
 
 ## Trust model (how to think about the WS connection, before filing "auth hole" bugs)
 
