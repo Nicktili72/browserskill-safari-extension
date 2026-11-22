@@ -47,7 +47,7 @@ ditto -c -k --keepParent "BrowserSkill for Safari.app" "BrowserSkill for Safari.
 xcrun notarytool submit "BrowserSkill for Safari.zip" --keychain-profile "<profile-name>" --wait
 ```
 
-**Then staple:** `./check-notarization.sh` (repo root) runs `stapler staple` on the export and tells you if it worked.
+**Then staple:** `./check-notarization.sh` (sibling of this file) runs `stapler staple` on the export and tells you if it worked.
 
 ### If `stapler` says "Record not found"
 
@@ -105,24 +105,4 @@ The extension was first built against bsk 0.3.x (protocol 1.3). Current upstream
 - Upstream added peer authorization (HMAC pairing / device authorization), but a peer that doesn't pair is still accepted through the daemon's **legacy** path (the same one the Chrome extension used before pairing); the Safari extension does not implement pairing.
 - Both daemon patches had to be re-done by hand: `origin_allowed()` lost its `allow_any` argument, and upload staging moved from `ipc.rs` into `tool_pipeline.rs` (now with `spawn_blocking`). They are re-generated as `daemon-origin-patch.diff` / `daemon-upload-patch.diff` against `dca6048e`.
 - Quick compatibility check after any upstream bump, without touching Safari: build upstream+patches, start its daemon with an isolated `BSK_HOME=/tmp/x` on port 52800, and run the extension's real `background.js` in Node (`dev/ext-harness.cjs`: a fake `browser` and a `WebSocket` subclass that sets the `Origin: safari-web-extension://<uuid>` header); then drive it with the new `bsk` CLI. (Node's built-in `WebSocket` accepts a `headers` option.) Results that fail with "decode result: missing field" come from the fake page, not the protocol.
-
-## Trust model (how to think about the WS connection, before filing "auth hole" bugs)
-
-The extension connects to the local `bsk` daemon over `ws://127.0.0.1:52800/extension`. Two gates exist on the daemon side, and they are **not** equal:
-
-- **`device_authorization` is the hard control.** It is checked before the handshake completes *and* during traffic; revoking a device ends the socket, and a revoked auth blocks handshake completion. This is the real trust decision.
-- **`origin_allowed()` is a soft gate only** (the upstream `ws.rs` comment says exactly that). Its job is stopping *ordinary webpage scripts* from opening a WebSocket at the daemon — browsers force `Origin: null` on such cross-origin WS, which the allow-list rejects. It was never designed to stop a process that can forge an `Origin` header, because any local process that can do that can already bind `127.0.0.1:52800` with no header at all and impersonate the extension protocol-shape-first.
-
-`daemon-origin-patch.diff` (merged) admits `chrome-extension://<uuid>` and `safari-web-extension://<uuid>` origins — the UUID Safari's `tools build` assigns per build. That is a **soft-gate widening**, not "the auth hole": the same class of caller (anything running as the user) could already reach the daemon with a faked or absent `Origin`. If you are reviewing this repo, judge the hard control (device authorization + the local-trust assumptions: loopback WS, single-user Mac), not the origin list.
-
-## Safari-only behaviour pinned by tests (`test/content-static.test.mjs`)
-
-- `press` on a form field with Enter: **`form.requestSubmit` only, no synthetic keydown/keyup dispatch.** Untrusted synthetic keydowns don't trigger native Enter-submit, but page JS that listens for Enter-keydown might submit on its own — dispatching *and* calling `requestSubmit` produced double submits. The key press is still reported in the tool result as `submitted: true`.
-- Refs accept a leading `@` (`'@e1'` → `e1`), matching upstream `ref-store.ts` `normaliseRef()`.
-- Screenshot width/height come from `viewportSize` (or `clientWidth/clientHeight × devicePixelRatio` if that fails) — not a hardcoded `0`; `0` only appears if both paths fail.
-
-## Remaining gaps
-
-- `tool.navigate` polls `tab.status` for up to 15 s: `'complete'` → `reached:'complete'` immediately (including same-document pushState hops, which never leave `'complete'`); still `'loading'` at 15 s → `reached:'timeout'` with the live url, no crash; tab closed mid-poll → `reached:'tab_closed'` (the daemon rejects the whole RPC on a thrown `tabs.get`, which says less than the structured answer). `final_url` is a single-point read — a redirect that finishes after the last poll reports the intermediate url with `reached:'timeout'`. Pinned by `test/navigate.test.mjs`.
-- `tool.screenshot` returns `{}` (→ daemon error `screenshot not available on this platform`) when `browser.tabs.captureVisibleTab` isn't exposed to the target — this happens on the CLI's own Windows/Linux Chromium when run without `--load-extension`, which has no extension in the loop at all and cannot act on the error either way.
-- `fill` refuses password fields with `permission_denied` — deliberate; do not "fix".
+- **Verified live on the protocol-2.0 build** (notarized + stapled app, Safari 27.3, daemon 0.5.0 with both patches, `BSK_AUTO_UPDATE=off`): session start/stop, tab create, navigate, snapshot, evaluate, click (followed a link), fill, screenshot (viewport + full page), network, upload (a 9-byte non-UTF-8 file read back byte-identical in the page) and hover (JS `mouseover`/`mouseenter`/`mousemove` listeners fire; CSS `:hover` rules don't, and the events are `isTrusted: false`). A bare "ws error" right after reinstalling is usually just the daemon not running; with it up, "no response from page" means the per-site permission ("Always Allow on Every Website") hasn't been granted yet.
